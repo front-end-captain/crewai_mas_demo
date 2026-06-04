@@ -19,6 +19,7 @@
 - Function Calling：如何实现工具调用机制
 - 多模态支持：如何处理图片输入
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -27,11 +28,20 @@ import json
 import logging
 import os
 import re
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import requests
 from crewai import BaseLLM
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
+
+    from crewai.agent.core import Agent
+    from crewai.task import Task
+    from crewai.tools.base_tool import BaseTool
+    from crewai.utilities.types import LLMMessage
 
 
 def _get_logger():
@@ -86,14 +96,18 @@ class AliyunLLM(BaseLLM):
         """
         super().__init__(model=model, temperature=temperature)
 
-        self.api_key = api_key or os.getenv("QWEN_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
+        self.api_key = (
+            api_key or os.getenv("QWEN_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
+        )
         if not self.api_key:
             raise ValueError(
                 "API Key 未提供。请通过 api_key 传入或设置环境变量 QWEN_API_KEY 或 DASHSCOPE_API_KEY"
             )
 
         if region not in self.ENDPOINTS:
-            raise ValueError(f"不支持的地域: {region}，支持: {list(self.ENDPOINTS.keys())}")
+            raise ValueError(
+                f"不支持的地域: {region}，支持: {list(self.ENDPOINTS.keys())}"
+            )
         self.endpoint = self.ENDPOINTS[region]
         self.region = region
         self.timeout = timeout
@@ -108,7 +122,9 @@ class AliyunLLM(BaseLLM):
                 _rc = 2
         self.retry_count = _rc if _rc is not None else 2
 
-    def _normalize_multimodal_tool_result(self, messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    def _normalize_multimodal_tool_result(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], bool]:
         """
         将 CrewAI 对 AddImageTool/AddImageToolLocal 的 stringify 结果还原为多模态 user 消息，
         否则 DashScope 会因消息格式或体积返回 400。
@@ -133,47 +149,72 @@ class AliyunLLM(BaseLLM):
             content = msg.get("content")
 
             # ── 新版 Function Calling：tool 消息 content 含 base64 data URL ───
-            if role == "tool" and isinstance(content, str) and "data:image/" in content and ";base64," in content:
+            if (
+                role == "tool"
+                and isinstance(content, str)
+                and "data:image/" in content
+                and ";base64," in content
+            ):
                 data_url_start = content.find("data:image/")
                 prefix = content[:data_url_start]
                 data_url = content[data_url_start:]
                 pending_images.append(data_url)
                 new_msg = dict(msg)
-                new_msg["content"] = (prefix + "图片内容已加载") if prefix else "图片内容已加载"
+                new_msg["content"] = (
+                    (prefix + "图片内容已加载") if prefix else "图片内容已加载"
+                )
                 out.append(new_msg)
                 flag = True
-                logger.info("normalized_multimodal_tool_result: function calling mode, base64 in tool message")
+                logger.info(
+                    "normalized_multimodal_tool_result: function calling mode, base64 in tool message"
+                )
                 continue
 
             # ── 新版 Function Calling：把图片合并到紧随其后的 user 消息 ──────
             # 注：仅在紧跟 tool 消息的第一条 user 消息时触发，与 CrewAI 当前消息结构一致
             if pending_images and role == "user":
                 text = content if isinstance(content, str) else ""
-                image_blocks = [{"type": "image_url", "image_url": {"url": u}} for u in pending_images]
-                out.append({
-                    "role": "user",
-                    "content": [{"type": "text", "text": text}] + image_blocks,
-                })
+                image_blocks = [
+                    {"type": "image_url", "image_url": {"url": u}}
+                    for u in pending_images
+                ]
+                out.append(
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": text}] + image_blocks,
+                    }
+                )
                 pending_images = []
-                logger.info("normalized_multimodal_tool_result: injected %d image(s) into user message (function calling)", len(image_blocks))
+                logger.info(
+                    "normalized_multimodal_tool_result: injected %d image(s) into user message (function calling)",
+                    len(image_blocks),
+                )
                 continue
 
             # ── 旧版 ReAct：assistant 消息 content 字符串含 Observation base64 ─
             # content 可能是 None（tool_calls 消息）或 list（多模态 assistant），均跳过
             if role == "assistant" and isinstance(content, str):
                 s = content
-                if "Add image to content Local" in s and "data:image/" in s and ";base64," in s:
-                    logger.info("normalized_multimodal_tool_result: ReAct mode, base64 in assistant message")
+                if (
+                    "Add image to content Local" in s
+                    and "data:image/" in s
+                    and ";base64," in s
+                ):
+                    logger.info(
+                        "normalized_multimodal_tool_result: ReAct mode, base64 in assistant message"
+                    )
                     data_url_start = s.find("data:image/")
                     data_url = s[data_url_start:]
                     text = s[:data_url_start] + "图片内容已加载"
-                    out.append({
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": text},
-                            {"type": "image_url", "image_url": {"url": data_url}},
-                        ],
-                    })
+                    out.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": text},
+                                {"type": "image_url", "image_url": {"url": data_url}},
+                            ],
+                        }
+                    )
                     flag = True
                     continue
                 elif "Add image to content Local" in s and "Observation: http" in s:
@@ -181,13 +222,15 @@ class AliyunLLM(BaseLLM):
                     http_start = s.find("http", obs_start)
                     data_url = s[http_start:]
                     text = s[:obs_start] + "图片内容已加载"
-                    out.append({
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": text},
-                            {"type": "image", "image": data_url},
-                        ],
-                    })
+                    out.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": text},
+                                {"type": "image", "image": data_url},
+                            ],
+                        }
+                    )
                     flag = True
                     continue
 
@@ -195,11 +238,18 @@ class AliyunLLM(BaseLLM):
 
         # ── Flush：tool 消息是最后一条（后面没有 user 消息）时合成一条 user 消息 ─
         if pending_images:
-            image_blocks = [{"type": "image_url", "image_url": {"url": u}} for u in pending_images]
-            out.append({
-                "role": "user",
-                "content": [{"type": "text", "text": "请分析上面工具返回的图片内容。"}] + image_blocks,
-            })
+            image_blocks = [
+                {"type": "image_url", "image_url": {"url": u}} for u in pending_images
+            ]
+            out.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "请分析上面工具返回的图片内容。"}
+                    ]
+                    + image_blocks,
+                }
+            )
             logger.warning(
                 "normalized_multimodal_tool_result: flushed %d pending image(s) — tool message was last in list",
                 len(image_blocks),
@@ -209,10 +259,14 @@ class AliyunLLM(BaseLLM):
 
     def call(
         self,
-        messages: str | list[dict[str, Any]],
-        tools: list[dict] | None = None,
+        messages: str | list[LLMMessage],
+        tools: list[dict[str, BaseTool]] | None = None,
         callbacks: list[Any] | None = None,
         available_functions: dict[str, Any] | None = None,
+        from_task: Task | None = None,
+        from_agent: Agent | None = None,
+        response_model: type[BaseModel] | None = None,
+        *,
         max_iterations: int = 10,
         _retry_on_empty: bool = True,
         **kwargs: Any,
@@ -236,14 +290,19 @@ class AliyunLLM(BaseLLM):
 
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
+        message_dicts = cast(list[dict[str, Any]], messages)
 
-        messages, flag = self._normalize_multimodal_tool_result(messages)
-        logger.info("normalized_multimodal_tool_result flag=%s messages=%s", flag, json.dumps(messages, ensure_ascii=False, indent=2))
-        self._validate_messages(messages)
+        message_dicts, flag = self._normalize_multimodal_tool_result(message_dicts)
+        logger.info(
+            "normalized_multimodal_tool_result flag=%s messages=%s",
+            flag,
+            json.dumps(message_dicts, ensure_ascii=False, indent=2),
+        )
+        self._validate_messages(message_dicts)
 
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": message_dicts,
         }
         if flag:
             payload["model"] = self.image_model
@@ -260,13 +319,20 @@ class AliyunLLM(BaseLLM):
             for cb in callbacks:
                 if hasattr(cb, "on_llm_start"):
                     try:
-                        cb.on_llm_start(messages)
+                        cb.on_llm_start(message_dicts)
                     except Exception:
                         pass
 
-        logger.info("发送 LLM API 请求 endpoint=%s model=%s", self.endpoint, payload.get("model"))
+        logger.info(
+            "发送 LLM API 请求 endpoint=%s model=%s",
+            self.endpoint,
+            payload.get("model"),
+        )
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("发送 LLM API 请求 payload=%s", json.dumps(payload, ensure_ascii=False, indent=2))
+            logger.debug(
+                "发送 LLM API 请求 payload=%s",
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
         last_exception: BaseException | None = None
         result: dict[str, Any] = {}
         for attempt in range(self.retry_count + 1):
@@ -301,7 +367,9 @@ class AliyunLLM(BaseLLM):
                             attempt + 1,
                             self.retry_count + 1,
                         )
-                        last_exception = RuntimeError(f"LLM 请求限流: {response.text[:200]}")
+                        last_exception = RuntimeError(
+                            f"LLM 请求限流: {response.text[:200]}"
+                        )
                         continue
                     response.raise_for_status()
                 elif status_code >= 400:
@@ -322,7 +390,10 @@ class AliyunLLM(BaseLLM):
                         self.retry_count + 1,
                     )
                 if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug("Response result: %s", json.dumps(result, ensure_ascii=False, indent=2))
+                    logger.debug(
+                        "Response result: %s",
+                        json.dumps(result, ensure_ascii=False, indent=2),
+                    )
                 break
 
             except requests.Timeout:
@@ -351,7 +422,11 @@ class AliyunLLM(BaseLLM):
                         self.retry_count + 1,
                     )
                     continue
-                logger.exception("llm_request_failed error=%s total_attempts=%s", str(e), self.retry_count + 1)
+                logger.exception(
+                    "llm_request_failed error=%s total_attempts=%s",
+                    str(e),
+                    self.retry_count + 1,
+                )
                 raise last_exception
         else:
             if last_exception:
@@ -365,7 +440,7 @@ class AliyunLLM(BaseLLM):
                         cb.on_llm_end(result)
                     except Exception:
                         pass
-        logger.info("收到 LLM API 响应  result=%s",  result)
+        logger.info("收到 LLM API 响应  result=%s", result)
         if "choices" not in result or not result["choices"]:
             raise ValueError("响应中未找到 choices 字段")
 
@@ -374,7 +449,7 @@ class AliyunLLM(BaseLLM):
             if available_functions:
                 return self._handle_function_calls(
                     message["tool_calls"],
-                    messages,
+                    message_dicts,
                     tools,
                     available_functions,
                     max_iterations - 1,
@@ -402,7 +477,7 @@ class AliyunLLM(BaseLLM):
                     max_empty_retries,
                 )
                 return self.call(
-                    messages,
+                    cast(list[LLMMessage], message_dicts),
                     tools=tools,
                     callbacks=callbacks,
                     available_functions=available_functions,
@@ -416,7 +491,7 @@ class AliyunLLM(BaseLLM):
             )
 
         return content
-    
+
     def _handle_function_calls(
         self,
         tool_calls: list[dict],
@@ -429,11 +504,13 @@ class AliyunLLM(BaseLLM):
         if max_iterations <= 0:
             raise RuntimeError("Function calling 达到最大迭代次数，可能存在无限循环")
 
-        messages.append({
-            "role": "assistant",
-            "content": None,
-            "tool_calls": tool_calls,
-        })
+        messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": tool_calls,
+            }
+        )
 
         for tool_call in tool_calls:
             fn_info = tool_call.get("function", {})
@@ -445,35 +522,47 @@ class AliyunLLM(BaseLLM):
             if fn_name in available_functions:
                 try:
                     raw = fn_info.get("arguments", "{}")
-                    args = json.loads(raw) if isinstance(raw, str) and raw.strip() else {}
+                    args = (
+                        json.loads(raw) if isinstance(raw, str) and raw.strip() else {}
+                    )
                 except json.JSONDecodeError as e:
                     raise ValueError(f"无法解析函数参数: {e}") from e
                 try:
                     function_result = available_functions[fn_name](**args)
                 except Exception as e:
                     function_result = f"函数执行错误: {str(e)}"
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": str(function_result),
-                })
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": str(function_result),
+                    }
+                )
             else:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": f"函数 {fn_name} 不可用",
-                })
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": f"函数 {fn_name} 不可用",
+                    }
+                )
 
-        return self.call(messages, tools, None, available_functions, max_iterations - 1)
+        return self.call(
+            cast(list[LLMMessage], messages),
+            tools=tools,
+            available_functions=available_functions,
+            max_iterations=max_iterations - 1,
+        )
 
     async def acall(
         self,
-        messages: str | list[dict[str, Any]],
-        tools: list[dict] | None = None,
+        messages: str | list[LLMMessage],
+        tools: list[dict[str, BaseTool]] | None = None,
         callbacks: list[Any] | None = None,
         available_functions: dict[str, Any] | None = None,
-        max_iterations: int = 10,
-        _retry_on_empty: bool = True,
+        from_task: Task | None = None,
+        from_agent: Agent | None = None,
+        response_model: type[BaseModel] | None = None,
         **kwargs: Any,
     ) -> str | Any:
         """异步调用阿里云 Chat Completions API，通过线程池执行同步 call。"""
@@ -483,29 +572,30 @@ class AliyunLLM(BaseLLM):
             tools=tools,
             callbacks=callbacks,
             available_functions=available_functions,
-            max_iterations=max_iterations,
-            _retry_on_empty=_retry_on_empty,
+            from_task=from_task,
+            from_agent=from_agent,
+            response_model=response_model,
             **kwargs,
         )
-    
+
     def supports_function_calling(self) -> bool:
         """
         是否支持 Function Calling
-        
+
         Returns:
             True，阿里云通义千问支持 Function Calling
         """
         return True
-    
+
     def supports_stop_words(self) -> bool:
         """
         是否支持停止词
-        
+
         Returns:
             True，阿里云通义千问支持 stop 参数
         """
         return True
-    
+
     def _validate_messages(self, messages: list[dict[str, Any]]) -> None:
         """校验消息格式（含多模态 content）。"""
         valid_roles = {"system", "user", "assistant", "tool"}
@@ -519,19 +609,16 @@ class AliyunLLM(BaseLLM):
                     raise ValueError(f"tool 消息 {i} 缺少 tool_call_id/content: {msg}")
             elif "content" not in msg and msg.get("tool_calls") is None:
                 raise ValueError(f"消息 {i} 缺少 content 且无 tool_calls: {msg}")
-            
 
     def _prepare_stop_words(
-        self, stop: str | list[str | int]
+        self, stop: str | Sequence[str | int]
     ) -> str | list[str | int] | None:
         """准备 stop 参数。"""
         if not stop:
             return None
         if isinstance(stop, str):
             return stop
-        if isinstance(stop, list) and stop:
-            return stop
-        return None
+        return list(stop)
 
     def get_context_window_size(self) -> int:
         """根据模型名返回上下文窗口大小（Token 数）。"""
@@ -551,18 +638,17 @@ if __name__ == "__main__":
         # api_key 参数可选，会从环境变量 QWEN_API_KEY 或 DASHSCOPE_API_KEY 读取
         # 或直接传入 "sk-xxx"
         region="cn",  # 或 "intl", "finance"
-        temperature=0.7
+        temperature=0.7,
     )
-    
+
     # 测试基本调用
     response = llm.call("你好，请介绍一下你自己")
     print("响应:", response)
-    
+
     # 测试多轮对话
-    messages = [
+    messages: list[LLMMessage] = [
         {"role": "system", "content": "你是一个有用的助手。"},
-        {"role": "user", "content": "1+1等于几？"}
+        {"role": "user", "content": "1+1等于几？"},
     ]
     response = llm.call(messages)
     print("多轮对话响应:", response)
-
